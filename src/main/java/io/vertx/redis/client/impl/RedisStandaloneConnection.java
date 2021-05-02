@@ -272,6 +272,31 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
                   .put("message", reply.get(3).toString())));
             return;
           }
+
+          if (reply.size() == 3 && "subscribe".equals(reply.get(0).toString())) {
+            // channel
+            eventBus.send(
+              BASE_ADDRESS + "." + reply.get(1).toString(),
+              new JsonObject()
+                .put("status", "OK")
+                .put("value", new JsonObject()
+                  .put("channel", reply.get(1).toString())
+                  .put("noChannels", reply.get(2).toString())));
+            return;
+          }
+
+          if (reply.size() == 3 && "psubscribe".equals(reply.get(0).toString())) {
+            // pattern
+            eventBus.send(
+              BASE_ADDRESS + "." + reply.get(1).toString(),
+              new JsonObject()
+                .put("status", "OK")
+                .put("value", new JsonObject()
+                  .put("pattern", reply.get(1).toString())
+                  .put("noPatterns", reply.get(2).toString())));
+            return;
+          }
+
           // fallback will just go to the log
         }
         LOG.warn("No handler waiting for message: " + reply);
