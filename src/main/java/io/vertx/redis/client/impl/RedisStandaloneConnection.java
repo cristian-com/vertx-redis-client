@@ -17,15 +17,16 @@ import io.vertx.redis.client.*;
 import io.vertx.redis.client.impl.types.ErrorType;
 import io.vertx.redis.client.impl.types.Multi;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class RedisStandaloneConnection implements RedisConnection, ParserHandler {
 
   private static final String BASE_ADDRESS = "io.vertx.redis";
+  private static final String SUBSCRIBE_BASE_ADDRESS = BASE_ADDRESS + ".subscribe";
+  private static final String UNSUBSCRIBE_BASE_ADDRESS = BASE_ADDRESS + ".unsubscribe";
 
   private static final Logger LOG = LoggerFactory.getLogger(RedisStandaloneConnection.class);
 
@@ -47,6 +48,11 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
   private Runnable onEvict;
   private boolean isValid;
 
+  private final HashMap<String, Integer> messageEventResponseSchema;
+  private final HashMap<String, Integer> pmessageEventResponseSchema;
+  private final HashMap<String, Integer> subscribeEventResponseSchema;
+  private final HashMap<String, Integer> unsubscribeEventResponseSchema;
+
   public RedisStandaloneConnection(Vertx vertx, ContextInternal context, PoolConnector.Listener connectionListener, NetSocket netSocket, RedisOptions options) {
     this.listener = connectionListener;
     this.vertx = (VertxInternal) vertx;
@@ -55,6 +61,24 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
     this.netSocket = netSocket;
     this.waiting = new ArrayQueue(options.getMaxWaitingHandlers());
     this.isValid = true;
+
+    pmessageEventResponseSchema = new HashMap<>();
+    pmessageEventResponseSchema.put("pattern", 1);
+    pmessageEventResponseSchema.put("channel", 2);
+    pmessageEventResponseSchema.put("message", 3);
+
+    messageEventResponseSchema = new HashMap<>();
+    messageEventResponseSchema.put("channel", 1);
+    messageEventResponseSchema.put("message", 2);
+
+    subscribeEventResponseSchema = new HashMap<>();
+    subscribeEventResponseSchema.put("channel", 1);
+    subscribeEventResponseSchema.put("noConnectedChannels", 2);
+
+    unsubscribeEventResponseSchema = new HashMap<>();
+    unsubscribeEventResponseSchema.put("channel", 1);
+    unsubscribeEventResponseSchema.put("noConnectedChannels", 2);
+
   }
 
   void forceClose() {
@@ -244,61 +268,10 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
       if (onMessage != null) {
         context.execute(reply, onMessage);
       } else {
-        // pub/sub messages are arrays
-        if (reply instanceof Multi) {
-          // Detect valid published messages according to https://redis.io/topics/pubsub
-
-          if (reply.size() == 3 && "message".equals(reply.get(0).toString())) {
-            // channel
-            eventBus.send(
-              BASE_ADDRESS + "." + reply.get(1).toString(),
-              new JsonObject()
-                .put("status", "OK")
-                .put("value", new JsonObject()
-                  .put("channel", reply.get(1).toString())
-                  .put("message", reply.get(2).toString())));
-            return;
-          }
-
-          if (reply.size() == 4 && "pmessage".equals(reply.get(0).toString())) {
-            // pattern
-            eventBus.send(
-              BASE_ADDRESS + "." + reply.get(1).toString(),
-              new JsonObject()
-                .put("status", "OK")
-                .put("value", new JsonObject()
-                  .put("pattern", reply.get(1).toString())
-                  .put("channel", reply.get(2).toString())
-                  .put("message", reply.get(3).toString())));
-            return;
-          }
-
-          if (reply.size() == 3 && "subscribe".equals(reply.get(0).toString())) {
-            // channel
-            eventBus.send(
-              BASE_ADDRESS + "." + reply.get(1).toString(),
-              new JsonObject()
-                .put("status", "OK")
-                .put("value", new JsonObject()
-                  .put("channel", reply.get(1).toString())
-                  .put("noChannels", reply.get(2).toString())));
-            return;
-          }
-
-          if (reply.size() == 3 && "psubscribe".equals(reply.get(0).toString())) {
-            // pattern
-            eventBus.send(
-              BASE_ADDRESS + "." + reply.get(1).toString(),
-              new JsonObject()
-                .put("status", "OK")
-                .put("value", new JsonObject()
-                  .put("pattern", reply.get(1).toString())
-                  .put("noPatterns", reply.get(2).toString())));
-            return;
-          }
-
-          // fallback will just go to the log
+        if (handleDefaultIfPubSubResponses(reply)) {
+          return;
         }
+
         LOG.warn("No handler waiting for message: " + reply);
       }
       return;
@@ -339,6 +312,91 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
         LOG.error("No handler waiting for message: " + reply);
       }
     });
+  }
+
+  private boolean handleDefaultIfPubSubResponses(Response response) {
+    boolean pubSubResponseHandled = false;
+    final int responseSize;
+    final String addressType;
+    final Map<String, Integer> schema;
+    final Map<String, Object> staticValues = new HashMap<>();
+
+    // pub/sub messages are arrays
+    if (response instanceof Multi) {
+      // Detect valid published messages according to https://redis.io/topics/pubsub
+
+      switch (response.get(0).toString()) {
+        case "message":
+          responseSize = 3;
+          addressType = BASE_ADDRESS + "." + "message";
+          schema = messageEventResponseSchema;
+        case "pmessage":
+          staticValues =
+          break;
+        case "subscribe":
+        case "psubscribe":
+          responseSize = 3;
+          addressType = SUBSCRIBE_BASE_ADDRESS;
+          schema = subscribeEventResponseSchema;
+          break;
+        case "unsubscribe":
+        case "unpsubscribe":
+          responseSize = 3;
+          addressType = UNSUBSCRIBE_BASE_ADDRESS;
+          schema = null;
+          break;
+        default:
+          throw new IllegalArgumentException("Unsupported PUB/SUB response type");
+      }
+
+      if (responseSize == response.size()) {
+        eventBus.publish(addressType, okJsonResponseFromMapSchema(response,
+          schema));
+      }
+    }
+
+    return pubSubResponseHandled;
+  }
+
+  private Map<String, Object> getMapWithPatternValue(JsonObject jsonObject, String pattern) {
+    jsonObject.put("pattern", pattern);
+    return jsonObject;
+  }
+
+  private JsonObject okJsonResponseFromMapSchema(Response response, Map<String, Integer> schema,
+                                                 HashMap<String, Object> staticValues) {
+    staticValues.putAll(schema.entrySet().stream()
+      .collect(Collectors.toMap(Map.Entry::getKey, entry -> response.get(entry.getValue()),
+        (oldOne, newOne) -> newOne)));
+
+     return okJsonResponse(staticValues);
+  }
+
+  private JsonObject okJsonResponse(Map<String, Object> elements) {
+    // Check JsonObjectMessageCodec - Probably more interesting
+    final JsonObject response = new JsonObject();
+    final JsonObject value = toJson(elements);
+
+    response.put("status", "OK");
+    response.put("value", value);
+
+    return response;
+  }
+
+  private JsonObject toJson(Object... elements) {
+    final JsonObject json = new JsonObject();
+    final int numEntries = json.size() / 2;
+
+    if (numEntries % 2 != 0) {
+      throw new IllegalArgumentException("The number of elements are not valid");
+    }
+
+    for (int entryCounter = 1; entryCounter < numEntries; entryCounter++) {
+      int i = entryCounter * 2;
+      json.put(elements[i].toString(), elements[i + 1]);
+    }
+
+    return json;
   }
 
   public void end(Void v) {
