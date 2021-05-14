@@ -48,10 +48,10 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
   private Runnable onEvict;
   private boolean isValid;
 
-  private final HashMap<String, Integer> messageEventResponseSchema;
-  private final HashMap<String, Integer> pmessageEventResponseSchema;
-  private final HashMap<String, Integer> subscribeEventResponseSchema;
-  private final HashMap<String, Integer> unsubscribeEventResponseSchema;
+  private final Map<String, Integer> messageEventResponseSchema;
+  private final Map<String, Integer> pmessageEventResponseSchema;
+  private final Map<String, Integer> subscribeEventResponseSchema;
+  private final Map<String, Integer> unsubscribeEventResponseSchema;
 
   public RedisStandaloneConnection(Vertx vertx, ContextInternal context, PoolConnector.Listener connectionListener, NetSocket netSocket, RedisOptions options) {
     this.listener = connectionListener;
@@ -268,13 +268,12 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
       if (onMessage != null) {
         context.execute(reply, onMessage);
       } else {
-        if (handleDefaultIfPubSubResponses(reply)) {
+        boolean pubSubReplyHandled = defaultPubSubResponsesHandler(reply);
+        if (pubSubReplyHandled) {
           return;
         }
-
-        LOG.warn("No handler waiting for message: " + reply);
       }
-      return;
+      LOG.warn("No handler waiting for message: " + reply);
     }
 
     // all update operations happen inside the context
@@ -314,24 +313,26 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
     });
   }
 
-  private boolean handleDefaultIfPubSubResponses(Response response) {
-    boolean pubSubResponseHandled = false;
+  private boolean defaultPubSubResponsesHandler(Response response) {
     final int responseSize;
     final String addressType;
     final Map<String, Integer> schema;
-    final Map<String, Object> staticValues = new HashMap<>();
+    final HashMap<String, Object> values = new HashMap<>();
 
     // pub/sub messages are arrays
     if (response instanceof Multi) {
-      // Detect valid published messages according to https://redis.io/topics/pubsub
-
+      // Detect valid published messages according to https://redis.io/topics/pubsubs
       switch (response.get(0).toString()) {
+        case "pmessage":
+          values.put("pattern", response.get(1).toString());
+          responseSize = 4;
+          addressType = BASE_ADDRESS + ".message" + response.get(0).toString();
+          schema = pmessageEventResponseSchema;
+          break;
         case "message":
           responseSize = 3;
-          addressType = BASE_ADDRESS + "." + "message";
+          addressType = BASE_ADDRESS + ".message" + response.get(0).toString();
           schema = messageEventResponseSchema;
-        case "pmessage":
-          staticValues =
           break;
         case "subscribe":
         case "psubscribe":
@@ -339,64 +340,46 @@ public class RedisStandaloneConnection implements RedisConnection, ParserHandler
           addressType = SUBSCRIBE_BASE_ADDRESS;
           schema = subscribeEventResponseSchema;
           break;
-        case "unsubscribe":
         case "unpsubscribe":
+        case "unsubscribe":
           responseSize = 3;
           addressType = UNSUBSCRIBE_BASE_ADDRESS;
-          schema = null;
+          schema = unsubscribeEventResponseSchema;
           break;
         default:
-          throw new IllegalArgumentException("Unsupported PUB/SUB response type");
+          return false;
       }
 
       if (responseSize == response.size()) {
         eventBus.publish(addressType, okJsonResponseFromMapSchema(response,
-          schema));
+          schema, values));
+        return true;
       }
     }
 
-    return pubSubResponseHandled;
+    return false;
   }
 
-  private Map<String, Object> getMapWithPatternValue(JsonObject jsonObject, String pattern) {
-    jsonObject.put("pattern", pattern);
-    return jsonObject;
-  }
+  private JsonObject okJsonResponseFromMapSchema(Response response, Map<String, Integer> responseValues,
+                                                 HashMap<String, Object> values) {
+    values.putAll(
+      responseValues.entrySet().stream()
+        .collect(
+          Collectors.toMap(Map.Entry::getKey,
+            entry -> response.get(entry.getValue()),
+            (oldOne, newOne) -> newOne)));
 
-  private JsonObject okJsonResponseFromMapSchema(Response response, Map<String, Integer> schema,
-                                                 HashMap<String, Object> staticValues) {
-    staticValues.putAll(schema.entrySet().stream()
-      .collect(Collectors.toMap(Map.Entry::getKey, entry -> response.get(entry.getValue()),
-        (oldOne, newOne) -> newOne)));
-
-     return okJsonResponse(staticValues);
+    return okJsonResponse(values);
   }
 
   private JsonObject okJsonResponse(Map<String, Object> elements) {
     // Check JsonObjectMessageCodec - Probably more interesting
     final JsonObject response = new JsonObject();
-    final JsonObject value = toJson(elements);
 
     response.put("status", "OK");
-    response.put("value", value);
+    response.put("value", new JsonObject(elements));
 
     return response;
-  }
-
-  private JsonObject toJson(Object... elements) {
-    final JsonObject json = new JsonObject();
-    final int numEntries = json.size() / 2;
-
-    if (numEntries % 2 != 0) {
-      throw new IllegalArgumentException("The number of elements are not valid");
-    }
-
-    for (int entryCounter = 1; entryCounter < numEntries; entryCounter++) {
-      int i = entryCounter * 2;
-      json.put(elements[i].toString(), elements[i + 1]);
-    }
-
-    return json;
   }
 
   public void end(Void v) {
